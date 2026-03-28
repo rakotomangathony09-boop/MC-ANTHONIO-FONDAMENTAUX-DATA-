@@ -1,125 +1,170 @@
 import streamlit as st
 import pandas as pd
 import yfinance as yf
-from datetime import datetime
+from datetime import datetime, timedelta
 import pytz
 import requests
 import os
-from typing import Optional, Dict
+import plotly.graph_objects as go
+from typing import Optional, Tuple, List, Dict
 
 # --- CONFIGURATION SYSTÈME ---
 st.set_page_config(
-    page_title="MICHEL ANTHONIO - XAU TERMINAL", 
+    page_title="MICHEL ANTHONIO - XAU TERMINAL ULTIMATE", 
     layout="wide", 
     initial_sidebar_state="collapsed"
 )
 
-# --- GESTION DES SECRETS & SÉCURITÉ ---
 class SecurityManager:
+    """Gère l'accès sécurisé aux credentials."""
     @staticmethod
     def get_credential(key: str) -> Optional[str]:
-        """Récupère les clés de manière sécurisée."""
-        val = os.environ.get(key) or st.secrets.get(key)
-        if not val:
-            st.warning(f"⚠️ Variable {key} manquante.")
-        return val
+        # Priorité aux variables d'environnement (Production)
+        return os.getenv(key) or st.secrets.get(key)
 
-# --- MOTEUR DE DONNÉES (LOGIQUE MÉTIER) ---
-class GoldEngine:
+class NewsEngine:
+    """Moteur d'analyse fondamentale via Finnhub."""
+    def __init__(self):
+        self.api_key = SecurityManager.get_credential("FINNHUB_API_KEY")
+        self.url = "https://finnhub.io/api/v1/calendar/economic"
+
+    @st.cache_data(ttl=3600)
+    def fetch_high_impact(_self) -> List[Dict]:
+        if not _self.api_key:
+            return []
+        try:
+            with requests.Session() as s:
+                res = s.get(_self.url, params={"token": _self.api_key}, timeout=10)
+                res.raise_for_status()
+                data = res.json().get("economicCalendar", [])
+                today = datetime.now(pytz.utc).strftime('%Y-%m-%d')
+                return [n for n in data if n['country'] == 'US' and n['impact'] == 'high' and n['date'].startswith(today)]
+        except Exception as e:
+            st.error(f"News Engine Error: {str(e)}")
+            return []
+
+    @staticmethod
+    def is_risky(news_list: List[Dict]) -> bool:
+        now_utc = datetime.now(pytz.utc)
+        for n in news_list:
+            n_time = datetime.fromisoformat(n['date'].replace('Z', '+00:00'))
+            # Fenêtre de risque : 30 min avant et après l'annonce
+            if abs((now_utc - n_time).total_seconds() / 60) <= 30:
+                return True
+        return False
+
+class SMCEngine:
+    """Algorithme Smart Money Concepts (SMC)."""
     @staticmethod
     @st.cache_data(ttl=60)
-    def fetch_data() -> pd.DataFrame:
-        """Récupère les données XAU/USD avec gestion d'erreur."""
-        try:
-            data = yf.Ticker("GC=F").history(period="2d", interval="15m")
-            if data.empty:
-                raise ValueError("DataFrame vide")
-            return data
-        except Exception as e:
-            st.error(f"Erreur Flux : {e}")
-            return pd.DataFrame()
+    def get_data(symbol: str = "GC=F") -> pd.DataFrame:
+        """Récupération optimisée des prix."""
+        return yf.Ticker(symbol).history(period="4d", interval="15m")
 
-# --- SERVICE DE NOTIFICATION ---
-def send_telegram_report(score: float):
-    """Envoie le rapport sans bloquer l'UI avec gestion de timeout."""
+    @staticmethod
+    def scan(df: pd.DataFrame) -> Tuple[str, float, float]:
+        if len(df) < 30:
+            return "INSUFFICIENT DATA", 0.0, 0.0
+        
+        # Identification des zones de liquidité (Lookback 20 bougies)
+        lookback = df.iloc[-25:-5]
+        h_liq = lookback['High'].max()
+        l_liq = lookback['Low'].min()
+        
+        curr = df.iloc[-1]
+        # Logique de Sweep institutionnel
+        bull_sweep = (curr['Low'] < l_liq) and (curr['Close'] > l_liq)
+        bear_sweep = (curr['High'] > h_liq) and (curr['Close'] < h_liq)
+        
+        if bull_sweep:
+            return "💎 STRONG BUY (LIQUIDITY SWEEP)", h_liq, l_liq
+        elif bear_sweep:
+            return "📉 STRONG SELL (LIQUIDITY SWEEP)", h_liq, l_liq
+        
+        return "WAITING FOR SMC SETUP", h_liq, l_liq
+
+    @staticmethod
+    def plot_smc_chart(df: pd.DataFrame, h_liq: float, l_liq: float, session_color: str):
+        fig = go.Figure()
+        fig.add_trace(go.Candlestick(
+            x=df.index, open=df['Open'], high=df['High'],
+            low=df['Low'], close=df['Close'], name="XAU/USD"
+        ))
+        
+        # Zones de liquidité
+        fig.add_hline(y=h_liq, line_dash="dash", line_color="#FF4444", annotation_text="LIQ HIGH")
+        fig.add_hline(y=l_liq, line_dash="dash", line_color="#44FF44", annotation_text="LIQ LOW")
+
+        fig.update_layout(
+            template="plotly_dark", xaxis_rangeslider_visible=False,
+            height=600, paper_bgcolor="#000", plot_bgcolor="#000",
+            margin=dict(l=0, r=0, t=0, b=0)
+        )
+        return fig
+
+def send_telegram_alert(signal: str, price: float, session: str):
+    """Envoi d'alerte sécurisé avec dédoublonnage."""
     token = SecurityManager.get_credential("TELEGRAM_TOKEN")
-    chat_id = SecurityManager.get_credential("CHAT_ID")
+    cid = SecurityManager.get_credential("CHAT_ID")
     
-    if not token or not chat_id:
+    if token and cid:
+        msg = f"🏛️ **SNIPER SIGNAL v4.0**\nSession: {session}\nSignal: {signal}\nPrice: {price:.2f}"
+        try:
+            requests.post(f"https://api.telegram.org/bot{token}/sendMessage", 
+                          data={"chat_id": cid, "text": msg, "parse_mode":"Markdown"}, 
+                          timeout=10)
+            return True
+        except Exception:
+            return False
+    return False
+
+def main():
+    # --- UI CUSTOM CSS ---
+    st.markdown("<style>.stMetric { background-color: #111; padding: 10px; border-radius: 10px; border: 1px solid #333; }</style>", unsafe_allow_html=True)
+
+    # Initialisation data
+    news_engine = NewsEngine()
+    df = SMCEngine.get_data()
+    if df.empty:
+        st.error("Connection error with Market Data API.")
         return
 
-    url = f"https://api.telegram.org/bot{token}/sendMessage"
-    payload = {
-        "chat_id": chat_id,
-        "text": f"🏛️ **LONDON OPEN BRIEFING**\n👤 Michel Anthonio\n📊 Gold Score : {score}/10\n🕒 {datetime.now().strftime('%H:%M')}",
-        "parse_mode": "Markdown"
-    }
+    # Analyse
+    news_list = news_engine.fetch_high_impact()
+    risk_status = news_engine.is_risky(news_list)
+    signal, h_zone, l_zone = SMCEngine.scan(df)
     
-    try:
-        # Timeout de 5s pour éviter de freezer l'application
-        requests.post(url, data=payload, timeout=5)
-        st.toast("✅ Rapport envoyé au terminal mobile.")
-    except requests.exceptions.RequestException as e:
-        st.error(f"Échec envoi Telegram : {e}")
+    # Header & Time
+    tana_now = datetime.now(pytz.timezone('Indian/Antananarivo'))
+    st.title("XAU/USD SNIPER PRO 🚀")
+    
+    c1, c2, c3 = st.columns(3)
+    c1.metric("ANTANANARIVO", tana_now.strftime("%H:%M:%S"))
+    c2.metric("CURRENT PRICE", f"${df['Close'].iloc[-1]:,.2f}")
+    c3.info(f"RISK STATUS: {'🔴 BLOCKED' if risk_status else '🟢 CLEAR'}")
 
-# --- INTERFACE (UI) ---
-def render_ui():
-    # Style CSS injecté (Identique à votre version originale)
-    st.markdown("""
-        <style>
-        @import url('https://fonts.googleapis.com/css2?family=Roboto+Mono:wght@400;700&display=swap');
-        html, body, [class*="css"] { font-family: 'Roboto Mono', monospace; background-color: #000000; color: #00CCFF; }
-        .stApp { background-color: #000000; }
-        .bloomberg-header { color: #FF9900; font-size: 28px; font-weight: bold; border-bottom: 2px solid #FF9900; padding-bottom: 10px; }
-        .metric-box { border: 1px solid #333; padding: 15px; border-radius: 5px; background: #0a0a0a; }
-        </style>
-        """, unsafe_allow_html=True)
+    # Layout Principal
+    col_main, col_side = st.columns([3, 1])
 
-    tana_tz = pytz.timezone('Indian/Antananarivo')
-    now_tana = datetime.now(tana_tz)
+    with col_main:
+        fig = SMCEngine.plot_smc_chart(df, h_zone, l_zone, "#00CCFF")
+        st.plotly_chart(fig, use_container_width=True)
 
-    # Header
-    col1, col2 = st.columns([3, 1])
-    with col1:
-        st.markdown('<p class="bloomberg-header">XAU/USD INSTITUTIONAL TERMINAL v1.1</p>', unsafe_allow_html=True)
-        st.markdown('<p style="color:#00CCFF;">PROPRIÉTAIRE : MICHEL ANTHONIO RAKOTOMANGA</p>', unsafe_allow_html=True)
-    with col2:
-        st.metric("TANA TIME", now_tana.strftime("%H:%M:%S"))
+    with col_side:
+        st.subheader("Signal Intelligence")
+        if "STRONG" in signal:
+            st.success(signal)
+            # Logique d'envoi unique
+            if not st.session_state.get('last_alert') == signal and not risk_status:
+                if send_telegram_alert(signal, df['Close'].iloc[-1], "LIVE"):
+                    st.session_state.last_alert = signal
+                    st.toast("Telegram Alert Dispatched!")
+        else:
+            st.warning(signal)
 
-    # Data Processing
-    df = GoldEngine.fetch_data()
-    if df.empty: st.stop()
-
-    price = df['Close'].iloc[-1]
-    change = price - df['Close'].iloc[-2]
-    total_score = 8.0 # Exemple de calcul dynamique issu de votre logique SMC
-
-    # Dashboard
-    c1, c2, c3 = st.columns([1, 2, 1])
-    with c1:
-        st.markdown('<div class="metric-box">', unsafe_allow_html=True)
-        st.metric("GOLD LIVE", f"${price:,.2f}", f"{change:+.2f}")
-        st.progress(0.15)
-        st.caption("Retail Bias: Strong Short (Bullish Confluence)")
-        st.markdown('</div>', unsafe_allow_html=True)
-
-    with c2:
-        st.line_chart(df['Close'], use_container_width=True)
-
-    with c3:
-        st.markdown('<div class="metric-box">', unsafe_allow_html=True)
-        st.subheader("SMC SCORE")
-        st.title(f"{total_score}/10")
-        if total_score >= 7.5: st.success("SIGNAL : BUY")
-        else: st.warning("SIGNAL : WAIT")
-        st.markdown('</div>', unsafe_allow_html=True)
-
-    # Logique d'envoi automatique sécurisée
-    # Utilisation d'un flag en session_state pour éviter les envois multiples (Race Condition)
-    if st.query_params.get("action") == "send_report":
-        if 'report_sent' not in st.session_state:
-            send_telegram_report(total_score)
-            st.session_state.report_sent = True
+    if news_list:
+        with st.expander("Economic Calendar"):
+            st.table(pd.DataFrame(news_list)[['event', 'date', 'impact']])
 
 if __name__ == "__main__":
-    render_ui()
+    main()
